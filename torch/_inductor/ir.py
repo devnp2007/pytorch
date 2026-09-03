@@ -3210,7 +3210,8 @@ class SplitScan(Scan):
 
 @ir_dataclass
 class Sort(Loops):
-    # Sorts a tuple of key, value pairs
+    """Sort a tuple of key/value pairs, optionally retaining only a Top-K prefix."""
+
     sort_ranges: list[Integer]
     size: list[Integer]
     reindex: Callable[[Sequence[Expr], Sequence[Expr]], Sequence[Expr]]
@@ -3222,6 +3223,7 @@ class Sort(Loops):
 
     stable: bool
     descending: bool
+    top_k: int | None = None
 
     # HACK we mimic reduction
 
@@ -3253,10 +3255,20 @@ class Sort(Loops):
     ) -> Any:
         idx = self.reindex(vars, reduction_vars)
         values = tuple(inner_fn(idx) for inner_fn in self.inner_fns)
-        result = ops.sort(self.dtypes, values, self.stable, self.descending)
-        return ops.store(
-            output_name or "unnamed", indexer(idx), result[self.output_index]
+        result = ops.sort(
+            self.dtypes, values, self.stable, self.descending, top_k=self.top_k
         )
+        value = result[self.output_index]
+        if self.top_k is not None:
+            # The selection lives in the first top_k lanes of the full sort
+            # range: predicate the store on the lane and keep the dependency
+            # index inside the compact output.
+            (rank,) = reduction_vars
+            lane = ops.index_expr(rank, torch.int64)
+            in_range = ops.lt(lane, ops.constant(self.top_k, torch.int64))
+            value = ops.set_store_mask(value, in_range)
+            idx = self.reindex(vars, [ModularIndexing(rank, 1, self.top_k)])
+        return ops.store(output_name or "unnamed", indexer(idx), value)
 
     def get_reduction_type(self) -> str | None:
         return "sort"
@@ -3295,11 +3307,15 @@ class Sort(Loops):
         axis: int,
         stable: bool,
         descending: bool,
+        top_k: int | None = None,
         reduction_hint: ReductionHint = ReductionHint.DEFAULT,
         **kwargs: Any,
     ) -> Sequence[TensorBox | None]:
         pointwise_ranges = [*size[:axis], *size[axis + 1 :]]
         sort_ranges = [size[axis]]
+        output_size = list(size)
+        if top_k is not None:
+            output_size[axis] = top_k
 
         if not V.graph.has_feature(device, BackendFeature.SORT):
             return [None] * len(dtypes)
@@ -3353,7 +3369,7 @@ class Sort(Loops):
                     dtypes=dtypes,
                     inner_fn=inner_fns[output_index],
                     inner_fns=inner_fns,
-                    size=size,
+                    size=output_size,
                     ranges=pointwise_ranges,
                     sort_ranges=sort_ranges,
                     reindex=reindex,
@@ -3361,6 +3377,7 @@ class Sort(Loops):
                     output_index=output_index,
                     stable=stable,
                     descending=descending,
+                    top_k=top_k,
                     **kwargs,
                 )
             )

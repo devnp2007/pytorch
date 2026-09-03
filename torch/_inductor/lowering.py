@@ -8214,38 +8214,32 @@ add = register_pointwise(
 sort_fallback = fallback_handler(aten.sort.stable, add_to_fallback_set=False)
 
 
-@register_lowering(aten.sort.stable, type_promotion_kind=None)
-def sort_stable(x, *, stable=None, dim=-1, descending=False):
-    if stable is None:
-        stable = False
-
+def _triton_sort(x, *, dim, stable, descending, top_k=None):
+    """Sort (or top-k select) x along dim as loop IR, or None if unsupported."""
     shape = x.get_size()
     device = x.get_device()
-    dim = canonicalize_dim(len(shape), dim)
-    if len(shape) == 0:
-        return clone(x), _full(0, device, torch.int64, shape)
-
-    dim_size = shape[dim] if len(shape) else 1
+    dim_size = shape[dim]
     # Use int32 indices when decompose_sort_ops is enabled, allowing sort
     # dimensions up to 2^31-1.  Default int16 keeps register pressure low
-    # on GPU where the bitonic network holds all indices in-block.
-    if config.triton.decompose_sort_ops:
+    # on GPU where the bitonic network holds all indices in-block.  Top-k
+    # packs lane indices next to the keys itself, so it can emit int64.
+    if top_k is not None:
+        idx_dtype = torch.int64
+    elif config.triton.decompose_sort_ops:
         idx_dtype = torch.int32
     else:
         idx_dtype = torch.int16
     if not V.graph.sizevars.guard_or_false(
         sympy.Lt(dim_size, torch.iinfo(idx_dtype).max)
     ):
-        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+        return None
 
     indices = iota(
         dim_size, start=0, step=1, dtype=idx_dtype, device=device, requires_grad=False
     )
     view_shape = [1] * len(shape)
-    if len(shape):
-        view_shape[dim] = dim_size
-    indices = view(indices, view_shape)
-    indices = expand(indices, shape)
+    view_shape[dim] = dim_size
+    indices = expand(view(indices, view_shape), shape)
 
     values, indices = ir.Sort.create(
         device=device,
@@ -8255,13 +8249,29 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False):
         axis=dim,
         stable=stable,
         descending=descending,
+        top_k=top_k,
     )
     if values is None:
-        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
-
+        return None
     if indices is None:
         raise AssertionError("expected: indices is not None")
     return values, to_dtype(indices, torch.int64)
+
+
+@register_lowering(aten.sort.stable, type_promotion_kind=None)
+def sort_stable(x, *, stable=None, dim=-1, descending=False):
+    if stable is None:
+        stable = False
+
+    shape = x.get_size()
+    dim = canonicalize_dim(len(shape), dim)
+    if len(shape) == 0:
+        return clone(x), _full(0, x.get_device(), torch.int64, shape)
+
+    result = _triton_sort(x, dim=dim, stable=stable, descending=descending)
+    if result is None:
+        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+    return result
 
 
 @register_lowering(aten.sort.default, type_promotion_kind=None)
@@ -8426,15 +8436,45 @@ def mode_default(self, dim=-1, keepdim=False):
     return mode_vals, mode_idxs
 
 
+def _use_triton_topk(x, k, dim) -> bool:
+    """Whether to select top-k in a fusible sort kernel instead of ATen."""
+    shape = x.get_size()
+    device = x.get_device()
+    if not (
+        config.triton.persistent_reductions
+        and device.type == "cuda"
+        and torch.version.hip is None
+        and V.graph.has_feature(device, BackendFeature.SORT)
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and dim == len(shape) - 1
+        and isinstance(k, (int, sympy.Integer))
+        and isinstance(shape[dim], (int, sympy.Integer))
+    ):
+        return False
+    k, width = int(k), int(shape[dim])
+    return (
+        2 <= k <= 16
+        and k <= width <= 256
+        and torch.cuda.get_device_capability(device) >= (9, 0)
+        and V.graph.sizevars.optimization_hint(sympy_product(shape[:dim])) > 0
+    )
+
+
 @register_lowering(aten.topk.default, type_promotion_kind=None)
 def topk(self, k, dim=-1, largest=True, sorted=True):
-    if not config.triton.decompose_sort_ops:
-        return topk_fallback(self, k, dim, largest, sorted)
     shape = self.get_size()
     ndim = len(shape)
     if ndim == 0:
         return clone(self), _full(0, self.get_device(), torch.int64, shape)
     dim = canonicalize_dim(ndim, dim)
+    if _use_triton_topk(self, k, dim):
+        result = _triton_sort(
+            self, dim=dim, stable=False, descending=largest, top_k=int(k)
+        )
+        if result is not None:
+            return result
+    if not config.triton.decompose_sort_ops:
+        return topk_fallback(self, k, dim, largest, sorted)
     sorted_vals, sorted_idxs = sort_stable(
         self, stable=True, dim=dim, descending=largest
     )

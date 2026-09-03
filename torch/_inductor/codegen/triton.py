@@ -1250,6 +1250,9 @@ class TritonCSEVariable(CSEVariable):
         super().__init__(name, bounds, dtype, shape=shape)
         # We'll use this to track which masks the variable needs when used for indirect indexing
         self.mask_vars: OrderedSet[str] = OrderedSet()
+        # A collective can produce fewer valid lanes than its reduction block.
+        # Such values carry an extra predicate to their eventual store.
+        self.store_mask: str | None = None
         if dtype is None:
             raise AssertionError("TritonCSEVariable must have dtype")
         if shape is None:
@@ -5156,11 +5159,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         var = self.args.output(name)
         original_index = index
         dtype = V.graph.get_dtype(name)
+        store_mask = getattr(value, "store_mask", None)
 
         buffer_misaligned = self._check_buffer_alignment(name, var, dtype)
 
         tma_compatibility_checker = None
-        if not buffer_misaligned and (mode is None or mode == "tma"):
+        if (
+            not buffer_misaligned
+            and store_mask is None
+            and (mode is None or mode == "tma")
+        ):
             force = mode == "tma" or getattr(self, "tma_store", False)
             tma_compatibility_checker = self.tma_compatibility_checker_cls(
                 self,
@@ -5172,10 +5180,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indexing = self.indexing(
             index,
             dense_indexing=True,
-            block_ptr=mode is None,
+            block_ptr=mode is None and store_mask is None,
             tma_compatibility_checker=tma_compatibility_checker,
             mask_constant_index=mode == "atomic_add",
         )
+        if store_mask is not None:
+            if not isinstance(indexing, IndexingOptions):
+                raise AssertionError("masked store requires standard indexing")
+            indexing.mask_vars.add(store_mask)
 
         if isinstance(indexing, IndexingOptions) and self._has_stride1_on_rdim(
             indexing.index
@@ -6694,6 +6706,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         values: tuple[CSEVariable, ...],
         stable: bool,
         descending: bool,
+        top_k: int | None = None,
     ) -> tuple[CSEVariable, ...]:
         if not self.inside_reduction:
             raise AssertionError("expected inside_reduction")
@@ -6750,10 +6763,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         rnumel = "None" if self._has_constant_mask(self.range_trees[-1]) else "rnumel"
 
         if len(values) == 2:
-            line = (
-                f"triton_helpers.sort_with_index({broadcasted_values[0]}, {broadcasted_values[1]},"
-                f" {rnumel}, {dim}, stable={stable}, descending={descending})"
-            )
+            if top_k is None:
+                line = (
+                    f"triton_helpers.sort_with_index({broadcasted_values[0]}, {broadcasted_values[1]},"
+                    f" {rnumel}, {dim}, stable={stable}, descending={descending})"
+                )
+            else:
+                if stable:
+                    raise AssertionError("top-k selection is unstable")
+                line = (
+                    f"triton_helpers.topk_with_index({broadcasted_values[0]}, {broadcasted_values[1]},"
+                    f" {rnumel}, {next_power_of_2(top_k)}, {dim}, descending={descending})"
+                )
             result_vars = cse_multiple(line, broadcasted_values, masks, dtypes)
         else:
             raise AssertionError("Unhandled sort")

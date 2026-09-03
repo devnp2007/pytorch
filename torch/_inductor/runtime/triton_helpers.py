@@ -958,6 +958,77 @@ def sort_with_index(
 
 
 @triton.jit
+def _topk_pack(x, idxs, rnumel, descending: tl.constexpr):
+    """Pack 32-bit floats and lane indices into int64 keys ordered like x.
+
+    The high word orders like the float (NaN above +inf, matching torch.sort),
+    the low word breaks ties by preferring lower lanes and keeps the NaN sign so
+    the unpacked value is bit-identical to the input.
+    """
+    bits = x.to(tl.int32, bitcast=True)
+    is_nan = x != x
+    nan_sign = is_nan & (bits < 0)
+    bits = tl.where(is_nan, bits & 0x7FFFFFFF, bits)
+    key = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+    lane = idxs.to(tl.int32)
+    if descending:
+        lane = 0x7FFFFFFF - lane
+    low = lane.to(tl.uint32) | (nan_sign.to(tl.uint32) << 31)
+    packed = (key.to(tl.int64) << 32) | low.to(tl.int64)
+    if rnumel is not None:
+        if descending:
+            packed = tl.where(idxs < rnumel, packed, -9223372036854775808)
+        else:
+            packed = tl.where(idxs < rnumel, packed, 9223372036854775807)
+    return packed
+
+
+@triton.jit
+def _topk_unpack(packed, descending: tl.constexpr):
+    key = (packed >> 32).to(tl.int32)
+    low = packed.to(tl.uint32)
+    bits = tl.where(key < 0, key ^ 0x7FFFFFFF, key)
+    neg_nan = ((key & 0x7FFFFFFF) > 0x7F800000) & ((low >> 31) != 0)
+    bits = tl.where(neg_nan, bits + (-2147483648), bits)
+    lane = (low & 0x7FFFFFFF).to(tl.int32)
+    if descending:
+        lane = 0x7FFFFFFF - lane
+    return bits.to(tl.float32, bitcast=True), lane
+
+
+@triton.jit
+def topk_with_index(
+    x,
+    idxs,
+    rnumel,
+    k: tl.constexpr,
+    dim: tl.constexpr = None,
+    descending: tl.constexpr = True,
+):
+    """Top-k of x with source indices, repeated across the reduction dim.
+
+    Lane r of the result holds rank r % k, so the first k lanes are the answer.
+    """
+    x, idxs = tl.broadcast(x, idxs)
+    _dim: tl.constexpr = len(x.shape) - 1 if dim is None else dim
+    tl.static_assert(
+        _dim == len(x.shape) - 1, "only minor dimension is currently supported"
+    )
+    tl.static_assert(x.dtype == tl.float32, "topk_with_index expects fp32 keys")
+    n: tl.constexpr = x.shape[_dim]
+
+    packed = _topk_pack(x, idxs, rnumel, descending)
+    top = tl.topk(packed, k, dim=_dim, descending=descending)
+    if n != k:
+        top = tl.reshape(
+            tl.broadcast_to(tl.expand_dims(top, _dim), x.shape[:_dim] + [n // k, k]),
+            x.shape,
+        )
+    values, lanes = _topk_unpack(top, descending)
+    return values, lanes.to(idxs.dtype)
+
+
+@triton.jit
 def select_one(x, mask, dim, keep_dims=False):
     idtype = tl.core.get_int_dtype(x.dtype.primitive_bitwidth, signed=False)
     ix = x.to(idtype, bitcast=True)
