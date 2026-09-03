@@ -51,8 +51,15 @@ class CudaKernelInputs final : public KernelInputs {
   CudaKernelInputs(size_t num_args, size_t num_attrs)
       : KernelInputs(num_args, num_attrs),
         arg_ptrs_(num_args),
-        global_scratch_(0) {
+        global_scratch_(0),
+        profile_scratch_(0) {
     inputs_.push_back(&global_scratch_);
+    // Some Triton kernel ABIs include profile scratch after global scratch.
+    // Kernels without it ignore this trailing parameter on both backends:
+    // cuLaunchKernel (CUDA) and hipModuleLaunchKernel (HIP/ROCm) read only as
+    // many entries as the compiled cubin/hsaco signature declares, so a surplus
+    // trailing pointer is never dereferenced.
+    inputs_.push_back(&profile_scratch_);
   }
   ~CudaKernelInputs() final = default;
 
@@ -72,6 +79,7 @@ class CudaKernelInputs final : public KernelInputs {
  private:
   std::vector<void*> arg_ptrs_;
   CUdeviceptr global_scratch_;
+  CUdeviceptr profile_scratch_;
 };
 
 class CudaTritonKernelManager final : public TritonKernelManager {
