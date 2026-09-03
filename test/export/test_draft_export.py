@@ -12,7 +12,13 @@ from torch.export import Dim, draft_export, export
 from torch.export._draft_export import DraftExportReport, FailureReport, FailureType
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.testing import FileCheck
-from torch.testing._internal.common_utils import IS_WINDOWS, run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    IS_WINDOWS,
+    requires_accelerator,
+    run_tests,
+    TestCase,
+)
 from torch.testing._internal.torchbind_impls import (
     _empty_tensor_queue,
     init_torchbind_implementations,
@@ -20,7 +26,12 @@ from torch.testing._internal.torchbind_impls import (
 from torch.utils._pytree import tree_leaves
 
 
+device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
+
+
 class TestDraftExport(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
         super().setUp()
         init_torchbind_implementations()
@@ -285,7 +296,7 @@ class TestDraftExport(TestCase):
                 ):
                     torch.ops.mylib.foo8(*inp)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "Requires cuda")
+    @requires_accelerator
     def test_missing_meta_kernel_guard(self):
         with torch.library._scoped_library("mylib", "FRAGMENT"):
 
@@ -317,8 +328,8 @@ class TestDraftExport(TestCase):
             m = ep.module()
             with self.assertRaisesRegex(RuntimeError, "Tensor device mismatch!"):
                 bad_device_inps = (
-                    torch.randn(2, 3, device=torch.device("cuda")),
-                    torch.randn(2, 3, device=torch.device("cuda")),
+                    torch.randn(2, 3, device=torch.device(device_type)),
+                    torch.randn(2, 3, device=torch.device(device_type)),
                 )
                 m(*bad_device_inps)
 
@@ -768,11 +779,11 @@ class TestDraftExport(TestCase):
             )
 
     @unittest.skipIf(
-        not torch.cuda.is_available()
-        or torch.cuda.get_device_properties(0).total_memory < 2**28,
+        not torch.accelerator.is_available()
+        or torch.accelerator.get_memory_info()[1] < 2**28,
         "Requires 16 MB GPU memory to pass the test; setting it higher to catch violations",
     )
-    def test_cuda_memory_usage(self):
+    def test_accelerator_memory_usage(self):
         # This used to OOM
         class Foo(torch.nn.Module):
             def forward(self, x):
@@ -781,17 +792,17 @@ class TestDraftExport(TestCase):
                 return x
 
         # measure base usage
-        device = torch.device("cuda:0")
-        torch.cuda.reset_peak_memory_stats()
-        base_usage = torch.cuda.memory_allocated(device)
+        device = torch.device(f"{device_type}:0")
+        torch.accelerator.reset_peak_memory_stats()
+        base_usage = torch.accelerator.memory_allocated(device)
 
         # usage with input tensor allocated
         x = torch.randn(2**10, 2**10).to(device)
-        x_usage = torch.cuda.memory_allocated(device)
+        x_usage = torch.accelerator.memory_allocated(device)
 
         # draft export peak memory usage
         draft_export(Foo(), (x,), strict=False)
-        peak_mem_usage = torch.cuda.memory_stats(device)["allocated_bytes.all.peak"]
+        peak_mem_usage = torch.accelerator.max_memory_allocated(device)
 
         # right now it's actually exactly 4x;
         # I guess original tensor, 2 tensors per add op, 1 for clone stored in node.meta["val"]
